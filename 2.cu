@@ -16,13 +16,24 @@
   Define all constant variavle below with a REASONABLE name
 */
 
-#define out_channel_num 6
-#define out_y_dim 358
-#define out_x_dim 638
-#define in_y_dim 720
-#define in_x_dim 1280
-#define filter_size 36
-
+#define out_channel_num 6 // number of feature maps
+#define out_y_dim 358 // height of output map
+#define out_x_dim 638 // width of output map
+#define in_y_dim 720  // height of input map
+#define in_x_dim 1280 // width of output map
+#define conv_window_y 6 // height of convolution window
+#define conv_window_x 6 // width of convolution window
+#define filter_size (conv_window_y * conv_window_x) // size of convolution window
+#define stride 2  // stride of layer
+#define init_bias_thread_x 16 // thread x dimension of init_bias
+#define init_bias_thread_y 16 // thread y dimension of init_bias
+#define init_bias_thread_z 2 // thread z dimension of init_bias
+#define feature_maps_thread_x 8 // thread x dimension of feature_maps
+#define feature_maps_thread_y 8 // thread y dimension of feature_maps
+#define feature_maps_thread_z 8 // thread z dimension of feature_maps
+#define sigmoid_thread_x 14 // thread x dimension of sigmoid
+#define sigmoid_thread_y 14 // thread y dimension of sigmoid
+#define sigmoid_thread_z 2 // thread z dimension of sigmoid
 
 /******************************************
  * Device function declaration
@@ -37,9 +48,7 @@ __global__ void layer1_sigmoid(float* d_y, unsigned char* d_out_layer);
  * Procedure: perform feed forward computation through the feature extraction layers
      *******************************************************************************/
 void cuda_convolution_layer1(unsigned char in_layer[], unsigned char out_layer[],
-			     const float bias[], const float weight[]) {
-
-  unsigned int i;
+           const float bias[], const float weight[]) {
 
   /*********************************
    * allocate device memory on GPU
@@ -105,7 +114,11 @@ void cuda_convolution_layer1(unsigned char in_layer[], unsigned char out_layer[]
   /* NOTE: threads per block limit is 1024 for K80 */
   /* NOTE: if you use another GPU, check the deviceQuery */
 
-  layer1_init_bias<<<???,???>>>(d_y, d_bias);
+  dim3 threadsPerBlock = dim3(init_bias_thread_x, init_bias_thread_y, init_bias_thread_z);
+  dim3 blocksPerGrid = dim3((out_x_dim + init_bias_thread_x - 1) / init_bias_thread_x, 
+          (out_y_dim + init_bias_thread_y - 1) / init_bias_thread_y, 
+          (out_channel_num + init_bias_thread_z - 1) / init_bias_thread_z);
+  layer1_init_bias<<<blocksPerGrid, threadsPerBlock>>>(d_y, d_bias);
 
   /* Just in case, put a sync here */
   cudaDeviceSynchronize();
@@ -119,9 +132,24 @@ void cuda_convolution_layer1(unsigned char in_layer[], unsigned char out_layer[]
    * The layer size is not diviadable by 8 either.
    * Mask out extra threads in the kernel.
    **********************************************/  
-  
-  layer1_feature_maps<<<???,???>>>(d_y, d_in_layer, d_weight);
 
+  threadsPerBlock = dim3(feature_maps_thread_x, feature_maps_thread_y, feature_maps_thread_z);
+  blocksPerGrid = dim3((out_x_dim + feature_maps_thread_x - 1) / feature_maps_thread_x, 
+          (out_y_dim + feature_maps_thread_y - 1) / feature_maps_thread_y, 
+          (out_channel_num + feature_maps_thread_z - 1) / feature_maps_thread_z);
+
+  // record time to execute layer1_feature_maps
+  float time;
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  cudaEventRecord(start, 0);
+  layer1_feature_maps<<<blocksPerGrid, threadsPerBlock>>>(d_y, d_in_layer, d_weight);
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  cudaEventElapsedTime(&time, start, stop);
+  printf("Time to execute layer1_feature_maps:  %3.1f ms \n", time);
+  
   /* Just in case, put a sync here */
   cudaDeviceSynchronize();
 
@@ -131,8 +159,12 @@ void cuda_convolution_layer1(unsigned char in_layer[], unsigned char out_layer[]
    * Layer 1, Step 3: 
    * sigmoid activation function
    ********************************************/
-  
-  layer1_sigmoid<<<???,???>>>(d_y, d_out_layer);
+
+  threadsPerBlock = dim3(sigmoid_thread_x, sigmoid_thread_y, sigmoid_thread_z);
+  blocksPerGrid = dim3((out_x_dim + sigmoid_thread_x - 1) / sigmoid_thread_x, 
+          (out_y_dim + sigmoid_thread_y - 1) / sigmoid_thread_y, 
+          (out_channel_num + sigmoid_thread_z - 1) / sigmoid_thread_z);
+  layer1_sigmoid<<<blocksPerGrid, threadsPerBlock>>>(d_y, d_out_layer);
 
   /* Just in case, put a sync here */
   cudaDeviceSynchronize();
@@ -162,6 +194,13 @@ void cuda_convolution_layer1(unsigned char in_layer[], unsigned char out_layer[]
  ********************************************/
 __global__ void layer1_init_bias(float* d_y, float* d_bias) {
 
+  int col = threadIdx.x + blockIdx.x * init_bias_thread_x;
+  int row = threadIdx.y + blockIdx.y * init_bias_thread_y;
+  int depth = threadIdx.z + blockIdx.z * init_bias_thread_z;
+
+  if (row < out_y_dim && col < out_x_dim && depth < out_channel_num)  // prevent out of bound access
+    d_y[depth * out_y_dim * out_x_dim + row * out_x_dim + col] = d_bias[depth]; // load the bias
+
 }
 
 /*********************************************
@@ -171,6 +210,44 @@ __global__ void layer1_init_bias(float* d_y, float* d_bias) {
  * 8*8*z(choose the correct z dimension) threads per block
  ********************************************/
 __global__ void layer1_feature_maps(float* d_y, unsigned char* d_in_layer, float* d_weight) {
+
+  int col = threadIdx.x + blockIdx.x * feature_maps_thread_x;
+  int row = threadIdx.y + blockIdx.y * feature_maps_thread_y;
+  int depth = threadIdx.z + blockIdx.z * feature_maps_thread_z;
+
+  // cache d_in_layer
+  __shared__ unsigned char in_layer[feature_maps_thread_y * stride + conv_window_y][feature_maps_thread_x * stride + conv_window_x];
+
+  // process [0, feature_maps_thread_y * stride - 1][0, feature_maps_thread_x * stride + conv_window_x - 1]
+  for (int i = 0; i < stride; i++) 
+      in_layer[threadIdx.y * stride + i][threadIdx.x * stride + depth] = 
+        d_in_layer[(row * stride + i) * in_x_dim + col * stride + depth];
+
+  // process [feature_maps_thread_y * stride, feature_maps_thread_y * stride + conv_window_y - 1][0, feature_maps_thread_x * stride - 1]
+  if (threadIdx.y == 0 && depth < conv_window_y)
+    for (int i = 0; i < stride; i++) {
+      in_layer[feature_maps_thread_y * stride + depth][threadIdx.x * stride + i] = 
+        d_in_layer[((row + feature_maps_thread_y) * stride + depth) * in_x_dim + col * stride + i];
+    }
+
+  // process [feature_maps_thread_y * stride, feature_maps_thread_y * stride + conv_window_y - 1][feature_maps_thread_x * stride, feature_maps_thread_x * stride + conv_window_x - 1]
+  if (threadIdx.x < conv_window_x && threadIdx.y == 0 && depth < conv_window_y)
+    in_layer[feature_maps_thread_y * stride + depth][feature_maps_thread_x * stride + threadIdx.x] = 
+      d_in_layer[((row + feature_maps_thread_y) * stride + depth) * in_x_dim + (col - threadIdx.x + feature_maps_thread_x) * stride + threadIdx.x];
+
+  // cache d_weight
+  __shared__ float weight[out_channel_num][filter_size];
+  if (threadIdx.y < out_y_dim && threadIdx.x < out_x_dim && depth < out_channel_num)
+    weight[depth][threadIdx.y * conv_window_x + threadIdx.x] = d_weight[depth * filter_size + threadIdx.y * conv_window_x + threadIdx.x];
+
+  __syncthreads();
+
+  if (row < out_y_dim && col < out_x_dim && depth < out_channel_num)  // prevent out of bound access
+    for (int k = 0; k < conv_window_y; k++)  // loop over convolution window (row)
+      for (int l = 0; l < conv_window_x; l++)  // loop over convolution window (column)
+        // perform convolution over a window
+        d_y[depth * out_y_dim * out_x_dim + row * out_x_dim + col] += 
+          in_layer[threadIdx.y * stride + k][threadIdx.x * stride + l] * weight[depth][k * conv_window_x + l];
 
 }
 
@@ -182,5 +259,12 @@ __global__ void layer1_feature_maps(float* d_y, unsigned char* d_in_layer, float
  ********************************************/
 __global__ void layer1_sigmoid(float* d_y, unsigned char* d_out_layer){
 
+  int col = threadIdx.x + blockIdx.x * sigmoid_thread_x;
+  int row = threadIdx.y + blockIdx.y * sigmoid_thread_y;
+  int depth = threadIdx.z + blockIdx.z * sigmoid_thread_z;
+  int idx = depth * out_y_dim * out_x_dim + row * out_x_dim + col;  // index in the grid
+
+  if (row < out_y_dim && col < out_x_dim && depth < out_channel_num)
+    d_out_layer[idx] = (unsigned char)(255.999f / (1 + expf(-d_y[idx] / 256))); // apply the sigmoid function to the result
 
 }

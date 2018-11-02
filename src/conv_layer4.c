@@ -378,6 +378,7 @@ int main(void) {
 	/* The GPU and CPU results may differ slightly, thus keep a margin. */
 	if(fabs( net_layer1[i*358*638+j*638+k] - cuda_net_layer1[i*358*638+j*638+k]) > 1.1 ){
 	  error_cnt++;
+		printf("%d, row:%d, col:%d",i, j, k);
 	}
       }
     }

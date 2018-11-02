@@ -52,8 +52,8 @@ build: cnn
 cuda_functions.o: cuda_functions.cu $(HEADERS)
 	$(NVCC) $(INCLUDES) $(NVCCFLAGS) -o $@ -c $<
 
-conv_layer4.o: conv_layer4.c $(HEADERS)
-	$(GCC) $(INCLUDES) -o $@ -c $<
+conv_layer4.o: conv_layer4.cu $(HEADERS)
+	$(NVCC) $(INCLUDES) $(NVCCFLAGS) -o $@ -c $<
 
 utils.o: utils.c $(HEADERS)
 	$(GCC) $(INCLUDES) -o $@ -c $<
