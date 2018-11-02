@@ -38,5 +38,7 @@ GPU layer 1 passed.
 ```
 
 1.cu and 2.cu are my implementation of the first convolution layer using GPU.
+
 [Report](3035380875.pdf)
+
 [Details](A2_v7.pdf)
